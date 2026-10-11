@@ -19,8 +19,9 @@ from pathlib import Path
 
 from db import get_unsynced_records, mark_synced
 
-TABLE = "trial_data"
-BATCH_SIZE = 100
+TABLE = "trial_measurements"
+CONFLICT_COLUMNS = "trial_code,site_name,plot_number,trait_name,assessment_date"
+BATCH_SIZE = 200
 
 
 def load_env_file(path=None):
@@ -37,12 +38,12 @@ def load_env_file(path=None):
 
 
 def build_payload(rows):
-    """Drop the local-only 'synced' flag before sending."""
-    return [{k: v for k, v in row.items() if k != "synced"} for row in rows]
+    """Drop the local-only data_id before sending."""
+    return [{k: v for k, v in row.items() if k != "data_id"} for row in rows]
 
 
 def _post_batch(url, key, rows, timeout):
-    endpoint = f"{url.rstrip('/')}/rest/v1/{TABLE}?on_conflict=record_id"
+    endpoint = f"{url.rstrip('/')}/rest/v1/{TABLE}?on_conflict={CONFLICT_COLUMNS}"
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(build_payload(rows)).encode("utf-8"),
@@ -82,7 +83,7 @@ def sync_to_supabase(timeout=10):
                     "detail": f"HTTP {err.code}: {err.read().decode('utf-8', 'ignore')[:200]}"}
         except (urllib.error.URLError, TimeoutError, OSError):   # no connection
             return {"status": "offline", "synced": synced, "pending": len(rows) - synced}
-        mark_synced([row["record_id"] for row in batch])
+        mark_synced([row["data_id"] for row in batch])
         synced += len(batch)
 
     return {"status": "ok", "synced": synced, "pending": 0}

@@ -1,36 +1,21 @@
 """
-AgriTrial OS - local database functions (SQLite, works offline).
+AgriTrial OS - local database functions (SQLite, works offline), version 2.
 
 Same pattern as the Week 19 practical: connect -> cursor -> execute with
 ? placeholders -> commit -> close.
+
+The form still sends ONE flat record (plot details + a value per test). save_record
+splits it into the normalised tables; get_records pivots it back (Week 20 "Pivot").
 """
 import os
 import sqlite3
 from pathlib import Path
 
-from validation import clean_record, validate_record
+from protocols import DERIVED_TRAITS
+from validation import clean_record, measurements_in, validate_record
 
 HERE = Path(__file__).parent
 SCHEMA_PATH = HERE / "schema.sql"
-
-CONTEXT_COLUMNS = ["record_id", "trial_code", "plot_id", "date", "site", "environment",
-                   "crop", "variety", "treatment_group", "rep_number", "trial_week",
-                   "observer", "field_notes"]
-PLANT_COLUMNS = ["height_cm", "leaf_count", "fresh_weight_g", "dry_weight_g",
-                 "chlorophyll_spad", "root_mass_g", "yield_value", "disease_pct"]
-ENV_COLUMNS = ["ph", "ec_mscm", "dissolved_o2", "temp_c", "humidity_pct",
-               "nitrate_mgl", "phosphate_mgl"]
-
-# measurement name -> table alias used in the JOIN below.
-# Column names cannot be passed as ? placeholders, so only these are allowed.
-MEASURES = {name: "pm" for name in PLANT_COLUMNS}
-MEASURES.update({name: "er" for name in ENV_COLUMNS})
-
-JOIN_SQL = """
-    FROM trial_context tc
-    JOIN plant_metrics pm ON tc.record_id = pm.record_id
-    JOIN environmental_readings er ON tc.record_id = er.record_id
-"""
 
 
 def db_path():
@@ -46,7 +31,7 @@ def get_connection():
 
 
 def create_tables():
-    """Create the three tables from schema.sql if they do not exist."""
+    """Create all tables from schema.sql if they do not exist."""
     conn = get_connection()
     with open(SCHEMA_PATH, "r") as f:
         conn.executescript(f.read())
@@ -54,111 +39,244 @@ def create_tables():
     conn.close()
 
 
-def build_record_id(trial_code, plot_id):
-    return f"{trial_code}-{plot_id}"
+# ---------------------------------------------------------------- trials (master data)
+def register_trial(definition):
+    """Add a trial, its treatments, sites and tests (traits). Safe to run twice.
+    `definition` is a dictionary like TOMATO_TRIAL in protocols.py."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT OR IGNORE INTO trials
+           (trial_code, trial_name, crop, variety, objective, planned_reps, start_date, end_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (definition["trial_code"], definition.get("trial_name"), definition["crop"],
+         definition.get("variety"), definition.get("objective"),
+         definition.get("planned_reps", 3), definition.get("start_date"),
+         definition.get("end_date")))
+    cursor.execute("SELECT trial_id FROM trials WHERE trial_code = ?", (definition["trial_code"],))
+    trial_id = cursor.fetchone()[0]
+
+    for name, details in definition["treatments"].items():
+        cursor.execute("""INSERT OR IGNORE INTO treatments (trial_id, treatment_name, formulation_details)
+                          VALUES (?, ?, ?)""", (trial_id, name, details))
+    for site_name, environment in definition.get("sites", []):
+        cursor.execute("""INSERT OR IGNORE INTO trial_sites (trial_id, site_name, environment)
+                          VALUES (?, ?, ?)""", (trial_id, site_name, environment))
+    for name, label, category, unit, minimum, maximum, method in definition["traits"]:
+        cursor.execute("""INSERT OR IGNORE INTO assessment_traits
+                          (trial_id, trait_name, label, category, unit, min_value, max_value, methodology)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (trial_id, name, label, category, unit, minimum, maximum, method))
+    conn.commit()
+    conn.close()
+    return trial_id
 
 
-def _insert_sql(table, columns):
-    marks = ", ".join("?" for _ in columns)
-    return f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({marks})"
+def list_trials():
+    conn = get_connection()
+    rows = conn.execute("SELECT trial_code, trial_name, crop, variety, planned_reps, status "
+                        "FROM trials ORDER BY trial_id").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
+def load_protocol(trial_code):
+    """Everything validation needs to know about a trial, or None if it is not registered."""
+    if not trial_code:
+        return None
+    conn = get_connection()
+    trial = conn.execute("SELECT * FROM trials WHERE trial_code = ?", (trial_code,)).fetchone()
+    if trial is None:
+        conn.close()
+        return None
+    treatments = conn.execute("SELECT treatment_id, treatment_name FROM treatments WHERE trial_id = ?",
+                              (trial["trial_id"],)).fetchall()
+    sites = conn.execute("SELECT trial_site_id, site_name FROM trial_sites WHERE trial_id = ?",
+                         (trial["trial_id"],)).fetchall()
+    traits = conn.execute("SELECT trait_id, trait_name, unit, min_value, max_value "
+                          "FROM assessment_traits WHERE trial_id = ?", (trial["trial_id"],)).fetchall()
+    conn.close()
+    return {
+        "trial_id": trial["trial_id"],
+        "crop": trial["crop"],
+        "variety": trial["variety"],
+        "planned_reps": trial["planned_reps"],
+        "sites": {s["site_name"]: s["trial_site_id"] for s in sites},
+        "treatments": {t["treatment_name"]: t["treatment_id"] for t in treatments},
+        "traits": {t["trait_name"]: {"id": t["trait_id"], "unit": t["unit"],
+                                     "min": t["min_value"], "max": t["max_value"]}
+                   for t in traits},
+    }
+
+
+# ---------------------------------------------------------------- saving
 def _friendly_error(error):
     text = str(error)
-    if "trial_context.record_id" in text:
-        return "this plot has already been captured (record_id exists)"
-    if "UNIQUE" in text:
-        return "duplicate replicate: this treatment, rep number and date is already recorded"
+    if "plots.trial_site_id, plots.treatment_id, plots.replicate_number" in text:
+        return "duplicate replicate: this treatment and rep number already exist in this trial"
+    if "assessment_data.plot_id" in text:
+        return "a reading for this plot, test and date has already been captured"
     return text
 
 
 def save_record(record):
-    """Validate a record and save it to all three tables.
-    Returns {"saved": True/False, "record_id": ..., "errors": [...]}."""
+    """Validate a flat record and save it into the normalised tables.
+    Returns {"saved": True/False, "record_id": ..., "readings": n, "errors": [...]}."""
     record = clean_record(record)
-    if not record.get("record_id") and record.get("trial_code") and record.get("plot_id") is not None:
-        record["record_id"] = build_record_id(record["trial_code"], record["plot_id"])
-
-    errors = validate_record(record)
+    protocol = load_protocol(record.get("trial_code"))
+    errors = validate_record(record, protocol)
+    record_id = f"{record.get('trial_code')}-{record.get('plot_number')}-{record.get('date')}"
     if errors:
-        return {"saved": False, "record_id": record.get("record_id"), "errors": errors}
+        return {"saved": False, "record_id": record_id, "readings": 0, "errors": errors}
+
+    readings = measurements_in(record, protocol)
+    observer = record.get("observer") or record.get("collected_by")
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(_insert_sql("trial_context", CONTEXT_COLUMNS),
-                       tuple(record.get(c) for c in CONTEXT_COLUMNS))
-        cursor.execute(_insert_sql("plant_metrics", ["record_id"] + PLANT_COLUMNS),
-                       (record["record_id"],) + tuple(record.get(c) for c in PLANT_COLUMNS))
-        cursor.execute(_insert_sql("environmental_readings", ["record_id"] + ENV_COLUMNS),
-                       (record["record_id"],) + tuple(record.get(c) for c in ENV_COLUMNS))
+        trial_site_id = protocol["sites"][record["site"]]
+        treatment_id = protocol["treatments"][record["treatment_group"]]
+
+        cursor.execute("SELECT plot_id, treatment_id, replicate_number FROM plots "
+                       "WHERE trial_site_id = ? AND plot_number = ?",
+                       (trial_site_id, record["plot_number"]))
+        plot = cursor.fetchone()
+        if plot is None:
+            cursor.execute("INSERT INTO plots (trial_site_id, plot_number, treatment_id, replicate_number) "
+                           "VALUES (?, ?, ?, ?)",
+                           (trial_site_id, record["plot_number"], treatment_id, record["rep_number"]))
+            plot_id = cursor.lastrowid
+        elif plot["treatment_id"] != treatment_id or plot["replicate_number"] != record["rep_number"]:
+            conn.rollback()
+            return {"saved": False, "record_id": record_id, "readings": 0,
+                    "errors": [f"plot {record['plot_number']} was already set up with a different "
+                               "treatment or replicate number"]}
+        else:
+            plot_id = plot["plot_id"]
+
+        for trait_name, value in readings.items():
+            cursor.execute("INSERT INTO assessment_data "
+                           "(plot_id, trait_id, assessment_date, numeric_value, collected_by) "
+                           "VALUES (?, ?, ?, ?, ?)",
+                           (plot_id, protocol["traits"][trait_name]["id"], record["date"], value, observer))
+        if record.get("field_notes"):
+            cursor.execute("INSERT INTO plot_notes (plot_id, note_date, note_text) VALUES (?, ?, ?) "
+                           "ON CONFLICT(plot_id, note_date) DO UPDATE SET "
+                           "note_text = note_text || ' | ' || excluded.note_text",
+                           (plot_id, record["date"], record["field_notes"]))
         conn.commit()
     except sqlite3.IntegrityError as error:
         conn.rollback()
-        return {"saved": False, "record_id": record["record_id"], "errors": [_friendly_error(error)]}
+        return {"saved": False, "record_id": record_id, "readings": 0, "errors": [_friendly_error(error)]}
     finally:
         conn.close()
 
-    return {"saved": True, "record_id": record["record_id"], "errors": []}
+    return {"saved": True, "record_id": record_id, "readings": len(readings), "errors": []}
 
 
-def _select_columns():
-    parts = ["tc." + c for c in CONTEXT_COLUMNS + ["synced"]]
-    parts += ["pm." + c for c in PLANT_COLUMNS]
-    parts += ["er." + c for c in ENV_COLUMNS]
-    return ", ".join(parts)
+# ---------------------------------------------------------------- reading
+READING_SQL = """
+    SELECT t.trial_code, t.crop, t.variety, ts.site_name, ts.environment,
+           p.plot_number, tr.treatment_name, p.replicate_number,
+           d.assessment_date, d.collected_by, d.synced,
+           a.trait_name, d.numeric_value, n.note_text
+    FROM assessment_data d
+    JOIN plots p             ON d.plot_id = p.plot_id
+    JOIN trial_sites ts      ON p.trial_site_id = ts.trial_site_id
+    JOIN trials t            ON ts.trial_id = t.trial_id
+    JOIN treatments tr       ON p.treatment_id = tr.treatment_id
+    JOIN assessment_traits a ON d.trait_id = a.trait_id
+    LEFT JOIN plot_notes n   ON n.plot_id = p.plot_id AND n.note_date = d.assessment_date
+    WHERE 1=1
+"""
 
 
 def get_records(trial_code=None, site=None, crop=None, treatment_group=None):
-    """Return full records (all three tables joined), optionally filtered."""
-    sql = "SELECT " + _select_columns() + JOIN_SQL + " WHERE 1=1"
-    params = []
-    for column, value in (("trial_code", trial_code), ("site", site),
-                          ("crop", crop), ("treatment_group", treatment_group)):
+    """Return one flat record per plot per date (the vertical table pivoted into columns),
+    plus any calculated values (e.g. oil_yield). Optionally filtered."""
+    sql, params = READING_SQL, []
+    for column, value in (("t.trial_code", trial_code), ("ts.site_name", site),
+                          ("t.crop", crop), ("tr.treatment_name", treatment_group)):
         if value:
-            sql += f" AND tc.{column} = ?"
+            sql += f" AND {column} = ?"
             params.append(value)
-    sql += " ORDER BY tc.plot_id"
+    sql += " ORDER BY p.plot_number, d.assessment_date, a.trait_id"
 
     conn = get_connection()
     rows = conn.execute(sql, params).fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    records = {}
+    for row in rows:
+        key = (row["trial_code"], row["site_name"], row["plot_number"], row["assessment_date"])
+        if key not in records:
+            records[key] = {
+                "record_id": f"{row['trial_code']}-{row['plot_number']}-{row['assessment_date']}",
+                "trial_code": row["trial_code"], "crop": row["crop"], "variety": row["variety"],
+                "site": row["site_name"], "environment": row["environment"],
+                "plot_number": row["plot_number"], "treatment_group": row["treatment_name"],
+                "rep_number": row["replicate_number"], "date": row["assessment_date"],
+                "observer": row["collected_by"], "field_notes": row["note_text"], "synced": 1,
+            }
+        records[key][row["trait_name"]] = row["numeric_value"]
+        if not row["synced"]:
+            records[key]["synced"] = 0
+
+    result = list(records.values())
+    for record in result:
+        for name, formula in DERIVED_TRAITS.get(record["trial_code"], {}).items():
+            record[name] = formula(record)
+    return result
+
+
+def known_measures():
+    """Every test name that exists in any trial, plus calculated ones."""
+    conn = get_connection()
+    names = {row[0] for row in conn.execute("SELECT DISTINCT trait_name FROM assessment_traits")}
+    conn.close()
+    for formulas in DERIVED_TRAITS.values():
+        names.update(formulas)
+    return names
 
 
 def get_values(measure, treatment_group, site=None, crop=None, trial_code=None):
     """Raw values of one measurement for one treatment group.
     This is what the CI calculation uses - means and CIs are never stored."""
-    if measure not in MEASURES:
+    if measure not in known_measures():
         raise ValueError(f"unknown measure '{measure}'")
-    alias = MEASURES[measure]
-    sql = (f"SELECT {alias}.{measure} {JOIN_SQL} "
-           f"WHERE tc.treatment_group = ? AND {alias}.{measure} IS NOT NULL")
-    params = [treatment_group]
-    for column, value in (("site", site), ("crop", crop), ("trial_code", trial_code)):
-        if value:
-            sql += f" AND tc.{column} = ?"
-            params.append(value)
-
-    conn = get_connection()
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [row[0] for row in rows]
+    records = get_records(trial_code=trial_code, site=site, crop=crop,
+                          treatment_group=treatment_group)
+    return [r[measure] for r in records if r.get(measure) is not None]
 
 
+# ---------------------------------------------------------------- cloud sync
 def get_unsynced_records():
-    """Records that have not reached Supabase yet."""
-    sql = "SELECT " + _select_columns() + JOIN_SQL + " WHERE tc.synced = 0 ORDER BY tc.plot_id"
+    """Readings that have not reached Supabase yet, one flat row per reading."""
+    sql = """
+        SELECT d.data_id, t.trial_code, t.crop, t.variety, ts.site_name, p.plot_number,
+               tr.treatment_name, p.replicate_number, a.trait_name, a.unit,
+               d.assessment_date, d.numeric_value, d.collected_by, n.note_text AS field_notes
+        FROM assessment_data d
+        JOIN plots p             ON d.plot_id = p.plot_id
+        JOIN trial_sites ts      ON p.trial_site_id = ts.trial_site_id
+        JOIN trials t            ON ts.trial_id = t.trial_id
+        JOIN treatments tr       ON p.treatment_id = tr.treatment_id
+        JOIN assessment_traits a ON d.trait_id = a.trait_id
+        LEFT JOIN plot_notes n   ON n.plot_id = p.plot_id AND n.note_date = d.assessment_date
+        WHERE d.synced = 0
+        ORDER BY d.data_id
+    """
     conn = get_connection()
     rows = conn.execute(sql).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 
-def mark_synced(record_ids):
+def mark_synced(data_ids):
     conn = get_connection()
-    conn.executemany("UPDATE trial_context SET synced = 1 WHERE record_id = ?",
-                     [(rid,) for rid in record_ids])
+    conn.executemany("UPDATE assessment_data SET synced = 1 WHERE data_id = ?",
+                     [(i,) for i in data_ids])
     conn.commit()
     conn.close()
 
