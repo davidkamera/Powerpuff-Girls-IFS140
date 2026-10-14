@@ -1,89 +1,137 @@
--- AgriTrial OS - local (offline) SQLite schema, version 2
--- Based on the lecturer's Week 20 "Agri-Trial Schema 140" example.
---
--- Why this shape: a "wide" table with one column per test is not normalised and is
--- inflexible (a new test means a new column; a different trial carries columns it never
--- uses). Here the master data is separate, and every reading is one row in
--- assessment_data: plot + trait + date + value. New tests, new crops and repeated
--- fortnightly readings need NO schema change.
--- Rule kept from v1: nothing that can be calculated (means, CIs, trial week) is stored.
+-- IN supabase form
 
--- A trial: one crop, one set of treatments, one set of tests
-CREATE TABLE IF NOT EXISTS trials (
-    trial_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    trial_code    TEXT NOT NULL UNIQUE,        -- e.g. TOM-BIO-2026-02
-    trial_name    TEXT,
-    crop          TEXT NOT NULL,               -- e.g. Tomato, Canola
-    variety       TEXT,                        -- e.g. Rutgers
-    objective     TEXT,
-    planned_reps  INTEGER NOT NULL DEFAULT 3,  -- replicates planned per treatment
-    start_date    TEXT,
-    end_date      TEXT,
-    status        TEXT NOT NULL DEFAULT 'active'
+-- 0. Remove the simple tables from the first version (this DELETES any data in them).
+drop table if exists public.measurements cascade;
+drop table if exists public.plots        cascade;
+drop table if exists public.trials       cascade;
+
+-- 1. Trials. user_id is the owner; it is filled in automatically from the logged-in user.
+create table public.trials (
+  trial_id      bigint generated always as identity primary key,
+  user_id       uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  trial_code    text not null unique,                 -- e.g. TOM-BIO-2026-02
+  trial_name    text,
+  crop          text not null,
+  variety       text,
+  objective     text,
+  planned_reps  integer not null default 3,
+  start_date    date,
+  end_date      date,
+  status        text not null default 'active'
 );
 
--- Treatment groups of a trial, with the protocol description (formulation) stored as text
-CREATE TABLE IF NOT EXISTS treatments (
-    treatment_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    trial_id             INTEGER NOT NULL REFERENCES trials(trial_id) ON DELETE CASCADE,
-    treatment_name       TEXT NOT NULL,        -- Control, BioStim-A ...
-    formulation_details  TEXT,                 -- protocol description (Markdown allowed)
-    UNIQUE (trial_id, treatment_name)
+create table public.treatments (
+  treatment_id         bigint generated always as identity primary key,
+  trial_id             bigint not null references public.trials(trial_id) on delete cascade,
+  treatment_name       text not null,
+  formulation_details  text,
+  unique (trial_id, treatment_name)
 );
 
--- Where a trial is run (a trial can run at several sites)
-CREATE TABLE IF NOT EXISTS trial_sites (
-    trial_site_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    trial_id       INTEGER NOT NULL REFERENCES trials(trial_id) ON DELETE CASCADE,
-    site_name      TEXT NOT NULL,
-    environment    TEXT,
-    UNIQUE (trial_id, site_name)
+create table public.trial_sites (
+  trial_site_id  bigint generated always as identity primary key,
+  trial_id       bigint not null references public.trials(trial_id) on delete cascade,
+  site_name      text not null,
+  environment    text,
+  unique (trial_id, site_name)
 );
 
--- A physical plot. One plot = one treatment + one replicate.
-CREATE TABLE IF NOT EXISTS plots (
-    plot_id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    trial_site_id     INTEGER NOT NULL REFERENCES trial_sites(trial_site_id) ON DELETE CASCADE,
-    plot_number       INTEGER NOT NULL,        -- number on the field sheet (101, 102 ...)
-    treatment_id      INTEGER NOT NULL REFERENCES treatments(treatment_id),
-    replicate_number  INTEGER NOT NULL,
-    UNIQUE (trial_site_id, plot_number),
-    -- the same replicate of a treatment cannot be set up twice ("collector wrote Rep 1 again")
-    UNIQUE (trial_site_id, treatment_id, replicate_number)
+create table public.plots (
+  plot_id           bigint generated always as identity primary key,
+  trial_site_id     bigint not null references public.trial_sites(trial_site_id) on delete cascade,
+  plot_number       integer not null,
+  treatment_id      bigint not null references public.treatments(treatment_id),
+  replicate_number  integer not null,
+  unique (trial_site_id, plot_number),
+  unique (trial_site_id, treatment_id, replicate_number)
 );
 
--- The tests a trial measures. The allowed range lives here, so validation is data-driven.
-CREATE TABLE IF NOT EXISTS assessment_traits (
-    trait_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    trial_id     INTEGER NOT NULL REFERENCES trials(trial_id) ON DELETE CASCADE,
-    trait_name   TEXT NOT NULL,                -- code used in forms and the API, e.g. yield_value
-    label        TEXT,                         -- display name, e.g. "Yield"
-    category     TEXT NOT NULL DEFAULT 'plant',  -- plant | environment | quality
-    unit         TEXT,
-    methodology  TEXT,
-    min_value    REAL,                         -- NULL = no limit
-    max_value    REAL,
-    UNIQUE (trial_id, trait_name)
+create table public.assessment_traits (
+  trait_id     bigint generated always as identity primary key,
+  trial_id     bigint not null references public.trials(trial_id) on delete cascade,
+  trait_name   text not null,
+  label        text,
+  category     text not null default 'plant',        -- plant | environment | quality
+  unit         text,
+  methodology  text,
+  min_value    numeric,
+  max_value    numeric,
+  unique (trial_id, trait_name)
 );
 
--- One row per reading: plot + trait + date + value (the "vertical" table)
-CREATE TABLE IF NOT EXISTS assessment_data (
-    data_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    plot_id          INTEGER NOT NULL REFERENCES plots(plot_id) ON DELETE CASCADE,
-    trait_id         INTEGER NOT NULL REFERENCES assessment_traits(trait_id),
-    assessment_date  TEXT NOT NULL,            -- ISO format YYYY-MM-DD
-    numeric_value    REAL NOT NULL,
-    collected_by     TEXT,
-    synced           INTEGER NOT NULL DEFAULT 0,   -- 0 = not yet in Supabase, 1 = synced
-    -- the same reading cannot be captured twice, but a plot can be measured again on a later date
-    UNIQUE (plot_id, trait_id, assessment_date)
+create table public.assessment_data (
+  data_id          bigint generated always as identity primary key,
+  plot_id          bigint not null references public.plots(plot_id) on delete cascade,
+  trait_id         bigint not null references public.assessment_traits(trait_id),
+  assessment_date  date not null,
+  numeric_value    numeric not null,
+  collected_by     text,
+  unique (plot_id, trait_id, assessment_date)
 );
 
--- Handwritten field notes for a plot on a visit ("slight wilt on E side")
-CREATE TABLE IF NOT EXISTS plot_notes (
-    note_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    plot_id    INTEGER NOT NULL REFERENCES plots(plot_id) ON DELETE CASCADE,
-    note_date  TEXT NOT NULL,
-    note_text  TEXT NOT NULL,
-    UNIQUE (plot_id, note_date)
+create table public.plot_notes (
+  note_id    bigint generated always as identity primary key,
+  plot_id    bigint not null references public.plots(plot_id) on delete cascade,
+  note_date  date not null,
+  note_text  text not null,
+  unique (plot_id, note_date)
 );
+
+-- Indexes for the foreign keys (Postgres does not add these automatically)
+create index on public.treatments (trial_id);
+create index on public.trial_sites (trial_id);
+create index on public.plots (trial_site_id);
+create index on public.plots (treatment_id);
+create index on public.assessment_traits (trial_id);
+create index on public.assessment_data (plot_id);
+create index on public.assessment_data (trait_id);
+create index on public.plot_notes (plot_id);
+
+-- 2. Row Level Security: a user can only see and change rows that belong to their own trials.
+alter table public.trials            enable row level security;
+alter table public.treatments        enable row level security;
+alter table public.trial_sites       enable row level security;
+alter table public.plots             enable row level security;
+alter table public.assessment_traits enable row level security;
+alter table public.assessment_data   enable row level security;
+alter table public.plot_notes        enable row level security;
+
+create policy "own trials" on public.trials for all to authenticated
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy "own treatments" on public.treatments for all to authenticated
+  using (exists (select 1 from public.trials t where t.trial_id = treatments.trial_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.trials t where t.trial_id = treatments.trial_id and t.user_id = auth.uid()));
+
+create policy "own sites" on public.trial_sites for all to authenticated
+  using (exists (select 1 from public.trials t where t.trial_id = trial_sites.trial_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.trials t where t.trial_id = trial_sites.trial_id and t.user_id = auth.uid()));
+
+create policy "own traits" on public.assessment_traits for all to authenticated
+  using (exists (select 1 from public.trials t where t.trial_id = assessment_traits.trial_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.trials t where t.trial_id = assessment_traits.trial_id and t.user_id = auth.uid()));
+
+create policy "own plots" on public.plots for all to authenticated
+  using (exists (select 1 from public.trial_sites s join public.trials t on t.trial_id = s.trial_id
+                 where s.trial_site_id = plots.trial_site_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.trial_sites s join public.trials t on t.trial_id = s.trial_id
+                      where s.trial_site_id = plots.trial_site_id and t.user_id = auth.uid()));
+
+create policy "own data" on public.assessment_data for all to authenticated
+  using (exists (select 1 from public.plots p join public.trial_sites s on s.trial_site_id = p.trial_site_id
+                 join public.trials t on t.trial_id = s.trial_id
+                 where p.plot_id = assessment_data.plot_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.plots p join public.trial_sites s on s.trial_site_id = p.trial_site_id
+                      join public.trials t on t.trial_id = s.trial_id
+                      where p.plot_id = assessment_data.plot_id and t.user_id = auth.uid()));
+
+create policy "own notes" on public.plot_notes for all to authenticated
+  using (exists (select 1 from public.plots p join public.trial_sites s on s.trial_site_id = p.trial_site_id
+                 join public.trials t on t.trial_id = s.trial_id
+                 where p.plot_id = plot_notes.plot_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.plots p join public.trial_sites s on s.trial_site_id = p.trial_site_id
+                      join public.trials t on t.trial_id = s.trial_id
+                      where p.plot_id = plot_notes.plot_id and t.user_id = auth.uid()));
+
+-- 3. Make Supabase pick up the new tables straight away
+notify pgrst, 'reload schema';
