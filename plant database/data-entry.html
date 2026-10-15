@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Enter trial data</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .entry { max-width: 640px; margin: 0 auto; padding: 0 16px 48px; font-family: system-ui, sans-serif; }
+  .entry h1 { text-align: center; }
+  .entry fieldset { border: 2px solid #111; border-radius: 8px; margin: 0 0 16px; padding: 12px 16px 16px; }
+  .entry legend { font-weight: 700; padding: 0 6px; }
+  .entry label { display: block; font-size: 14px; margin-top: 10px; }
+  .entry label small { color: #666; }
+  .entry input, .entry select { width: 100%; padding: 10px; margin-top: 4px; font-size: 16px; box-sizing: border-box; }
+  .entry .save { width: 100%; padding: 12px; font-size: 16px; font-weight: bold; cursor: pointer; background: #02e255; border: 2px solid #111; border-radius: 6px; }
+  .entry .save:disabled { opacity: .5; cursor: not-allowed; }
+  .entry .save:focus-visible, .entry input:focus-visible, .entry select:focus-visible { outline: 3px solid #111; outline-offset: 2px; }
+  #msg { min-height: 1.4em; text-align: center; font-weight: 600; }
+  #msg.err { color: #b00020; }
+  #msg.ok { color: #067a2f; }
+  .hint { color: #666; font-size: 14px; }
+  .topnav { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.navbtn { padding: 8px 16px; border: 2px solid black; border-radius: 6px; font-weight: bold; text-decoration: none; color: inherit; background: #fff; }
+.navbtn[aria-current="page"] { background: #02e255; }
+</style>
+</head>
+<body style="margin-right:0">
+  <h1>Enter trial data</h1>
+  <div class="entry">
+    <div class="topnav">
+  <a href="dashboard.html" class="navbtn">Dashboard</a>
+  <a href="data-entry.html" class="navbtn" aria-current="page">Enter data</a>
+</div>
+    <p id="msg" role="status"></p>
+
+    <form id="entry-form">
+      <fieldset>
+        <legend>1. Which plot?</legend>
+        <label>Trial
+          <select id="trial" required></select>
+        </label>
+        <label>Plot
+          <select id="plot" required></select>
+        </label>
+        <p id="plot-hint" class="hint"></p>
+      </fieldset>
+
+      <fieldset>
+        <legend>2. When and who?</legend>
+        <label>Date collected
+          <input id="date" type="date" required>
+        </label>
+        <label>Collected by
+          <input id="by" placeholder="Your name" autocomplete="name">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>3. Measurements</legend>
+        <p class="hint">Fill in the tests you measured on this plot. Leave the others blank.</p>
+        <div id="traits"></div>
+      </fieldset>
+
+      <button type="submit" class="save" id="save">Save and go to next plot</button>
+    </form>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="api.js"></script>
+  <script>
+    const supabaseClient = window.supabase.createClient('https://vfewattbwlfuxdcozouz.supabase.co', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZmZXdhdHRid2xmdXhkY296b3V6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE5MDk3MTYsImV4cCI6MjEwNzQ4NTcxNn0.vauaMzbxjwVi4VTA55TT6MtD7GM4hznt9ftIoyN3G2Q');
+    const api = createApi(supabaseClient);
+    const $ = (id) => document.getElementById(id);
+    let traits = [];
+    let plots = [];
+
+    function say(text, kind) { $('msg').textContent = text || ''; $('msg').className = kind || ''; }
+    async function run(fn) { try { say(); await fn(); } catch (e) { say(e.message, 'err'); } }
+
+    function fillSelect(id, rows, valueKey, label, emptyText) {
+      const sel = $(id); sel.replaceChildren();
+      if (!rows.length) {
+        const o = document.createElement('option'); o.value = ''; o.textContent = emptyText; sel.appendChild(o); return;
+      }
+      rows.forEach((r) => { const o = document.createElement('option'); o.value = r[valueKey]; o.textContent = label(r); sel.appendChild(o); });
+    }
+
+    function drawTraitInputs() {
+      const box = $('traits'); box.replaceChildren();
+      if (!traits.length) {
+        const p = document.createElement('p'); p.className = 'hint';
+        p.textContent = 'This trial has no tests yet. Add them in the dashboard first.';
+        box.appendChild(p); return;
+      }
+      traits.forEach((t) => {
+        const label = document.createElement('label');
+        label.textContent = (t.label || t.trait_name) + (t.unit ? ' (' + t.unit + ')' : '') + ' ';
+        if (t.min_value !== null || t.max_value !== null) {
+          const s = document.createElement('small');
+          s.textContent = 'allowed ' + (t.min_value ?? '...') + ' to ' + (t.max_value ?? '...');
+          label.appendChild(s);
+        }
+        const input = document.createElement('input');
+        input.type = 'number'; input.step = 'any'; input.dataset.traitId = t.trait_id; input.inputMode = 'decimal';
+        label.appendChild(input); box.appendChild(label);
+      });
+    }
+
+    function showPlotHint() {
+      const p = plots.find((x) => String(x.plot_id) === $('plot').value);
+      $('plot-hint').textContent = p
+        ? 'Site: ' + p.trial_sites.site_name + '. Treatment: ' + p.treatments.treatment_name + '. Replicate ' + p.replicate_number + '.'
+        : '';
+    }
+
+    async function loadTrial() {
+      const id = Number($('trial').value);
+      if (!id) { traits = []; plots = []; fillSelect('plot', [], '', null, 'No plots yet'); drawTraitInputs(); showPlotHint(); return; }
+      [traits, plots] = await Promise.all([api.traits.listForTrial(id), api.plots.listForTrial(id)]);
+      fillSelect('plot', plots, 'plot_id',
+        (p) => 'Plot ' + p.plot_number + ' (' + p.trial_sites.site_name + ', ' + p.treatments.treatment_name + ')',
+        'No plots yet. Add them in the dashboard.');
+      drawTraitInputs(); showPlotHint();
+    }
+
+    $('trial').addEventListener('change', () => run(loadTrial));
+    $('plot').addEventListener('change', showPlotHint);
+
+    $('entry-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      run(async () => {
+        const plotId = Number($('plot').value);
+        if (!plotId) throw new Error('Choose a plot first.');
+        const inputs = [...document.querySelectorAll('#traits input')].filter((i) => i.value.trim() !== '');
+        if (!inputs.length) throw new Error('Enter at least one measurement.');
+
+        const rows = inputs.map((i) => {
+          const t = traits.find((x) => x.trait_id === Number(i.dataset.traitId));
+          const v = Number(i.value);
+          const name = t.label || t.trait_name;
+          if (t.min_value !== null && v < t.min_value) throw new Error(name + ' ' + v + ' is below the minimum of ' + t.min_value + '.');
+          if (t.max_value !== null && v > t.max_value) throw new Error(name + ' ' + v + ' is above the maximum of ' + t.max_value + '.');
+          return { plot_id: plotId, trait_id: t.trait_id, assessment_date: $('date').value, numeric_value: v, collected_by: $('by').value.trim() || null };
+        });
+
+        $('save').disabled = true;
+        try {
+          for (const r of rows) await api.readings.create(r);
+        } finally { $('save').disabled = false; }
+
+        const done = $('plot').options[$('plot').selectedIndex].textContent;
+        inputs.forEach((i) => { i.value = ''; });
+        const next = $('plot').selectedIndex + 1;
+        if (next < $('plot').options.length) { $('plot').selectedIndex = next; showPlotHint(); }
+        say('Saved ' + rows.length + ' reading' + (rows.length > 1 ? 's' : '') + ' for ' + done + '.', 'ok');
+        const first = document.querySelector('#traits input'); if (first) first.focus();
+      });
+    });
+
+    (async () => {
+      const { data } = await supabaseClient.auth.getSession();
+      if (!data.session) { window.location.href = 'index.html'; return; }
+      $('date').valueAsDate = new Date();
+      run(async () => {
+        const trials = await api.trials.list();
+        fillSelect('trial', trials, 'trial_id', (t) => t.trial_code + ' (' + t.crop + ')', 'No trials yet. Add one in the dashboard.');
+        await loadTrial();
+      });
+    })();
+  </script>
+</body>
+</html>
