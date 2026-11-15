@@ -1,9 +1,0 @@
-site,bed,crop,species,planted,treatment,mean_height_cm,n_plants
-Village Garden,40,Beans,Phaseolus vulgaris,2025-08,control,12.1,
-Village Garden,40,Beans,Phaseolus vulgaris,2025-08,treated,21.7 cm,
-Village Garden,26,Onions,Allium cepa,2025-06,control,31.6,
-Village Garden,26,Onions,Allium cepa,2025-06,treated,36 cm,
-Village Garden,38,Carrots,Daucus carota,2025-07,control,15.8,
-Village Garden,38,Carrots,Daucus carota,2025-07,treated,18.2,
-Village Garden,2,Spinach,Spinacia oleracea,2024-12,control,351.0,
-Village Garden,2,Spinach,Spinacia oleracea,2024-12,treated,31.6,
